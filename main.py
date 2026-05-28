@@ -24,7 +24,7 @@ from telegram.ext import (
 
 load_dotenv()
 
-from prompts import SYSTEM_PROMPT, BILET_CONTEXT_TEMPLATE
+from prompts import SYSTEM_PROMPT, BILET_CONTEXT_TEMPLATE, PRAKTIKA_INSTRUCTIONS
 from access import (
     init_db,
     is_admin,
@@ -68,10 +68,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+PRAKTIKA_FILE_IDS_PATH = BASE_DIR / "praktika_file_ids.json"
+if PRAKTIKA_FILE_IDS_PATH.exists():
+    PRAKTIKA_FILE_IDS: dict[int, str] = {
+        int(k): v
+        for k, v in json.loads(PRAKTIKA_FILE_IDS_PATH.read_text(encoding="utf-8")).items()
+    }
+    logger.info(f"Загружено практических заданий: {len(PRAKTIKA_FILE_IDS)}")
+else:
+    logger.warning("praktika_file_ids.json не найден — режим 'практическое задание' будет недоступен")
+    PRAKTIKA_FILE_IDS = {}
+
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("Полный ответ"), KeyboardButton("Кратко")],
         [KeyboardButton("Объясни просто"), KeyboardButton("Дополнительные вопросы")],
+        [KeyboardButton("Практическое задание")],
         [KeyboardButton("Проверить меня"), KeyboardButton("Сменить билет")],
     ],
     resize_keyboard=True,
@@ -83,8 +95,16 @@ BUTTON_MODES = {
     "кратко": "short",
     "объясни просто": "simple",
     "дополнительные вопросы": "extra",
+    "практическое задание": "praktika",
     "проверить меня": "quiz",
 }
+
+
+def praktika_unavailable_message(bilet_num: int) -> str:
+    return (
+        f"Практическое задание для билета {bilet_num} пока недоступно — "
+        f"Министерство образования не публикует его централизованно."
+    )
 
 
 def request_access_keyboard() -> InlineKeyboardMarkup:
@@ -187,11 +207,36 @@ async def send_long_message(update: Update, text: str, reply_markup=None) -> Non
             await update.message.reply_text(chunk)
 
 
-def call_openai(instructions: str, user_input: str, use_search: bool = True) -> str:
+CITATION_RE = re.compile(r"【[^】]*†[^】]*】")
+
+
+def _strip_citations(text: str) -> str:
+    return CITATION_RE.sub("", text).strip()
+
+
+def call_openai(
+    instructions: str,
+    user_input: str,
+    use_search: bool = True,
+    attached_file_id: str | None = None,
+) -> str:
+    if attached_file_id:
+        input_payload = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_file", "file_id": attached_file_id},
+                    {"type": "input_text", "text": user_input},
+                ],
+            }
+        ]
+    else:
+        input_payload = user_input
+
     kwargs = dict(
         model="gpt-4.1-mini",
         instructions=instructions,
-        input=user_input,
+        input=input_payload,
         temperature=0.2,
     )
     if use_search:
@@ -214,7 +259,7 @@ def call_openai(instructions: str, user_input: str, use_search: bool = True) -> 
                     answer_parts.append(content.text)
 
     if answer_parts:
-        return "\n".join(answer_parts).strip()
+        return _strip_citations("\n".join(answer_parts).strip())
     return ""
 
 
@@ -336,6 +381,24 @@ def ask_openai(user_text: str) -> str:
 
 def ask_openai_mode(user_text: str, mode: str, bilet_num: int | None = None) -> str:
     bilet_text = load_bilet_text(bilet_num) if bilet_num else None
+
+    if mode == "praktika":
+        file_id = PRAKTIKA_FILE_IDS.get(bilet_num) if bilet_num else None
+        if not file_id:
+            return f"Практическое задание для билета {bilet_num} пока не подготовлено."
+
+        parts = []
+        if bilet_text:
+            parts.append(BILET_CONTEXT_TEMPLATE.format(bilet_text=bilet_text))
+        parts.append(user_text)
+
+        result = call_openai(
+            instructions=SYSTEM_PROMPT + "\n\n" + PRAKTIKA_INSTRUCTIONS,
+            user_input="\n".join(parts),
+            use_search=True,
+            attached_file_id=file_id,
+        )
+        return result or "Не удалось получить ответ. Попробуй ещё раз."
 
     input_parts = []
     if bilet_text:
@@ -509,6 +572,7 @@ async def execute_mode(update: Update, context: ContextTypes.DEFAULT_TYPE, mode:
         "short": f"Билет {bilet_num} кратко",
         "simple": f"Объясни просто билет {bilet_num}",
         "extra": f"Дополнительные вопросы к билету {bilet_num}",
+        "praktika": f"Разбери практическое задание (второй вопрос) к билету {bilet_num}.",
     }
     user_text = mode_prompts.get(mode, f"Билет {bilet_num}")
 
@@ -631,9 +695,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if "pending_mode" in context.user_data:
         bilet_num = extract_bilet_number(user_text)
         if bilet_num:
+            mode = context.user_data["pending_mode"]
+            if mode == "praktika" and bilet_num not in PRAKTIKA_FILE_IDS:
+                context.user_data.pop("pending_mode", None)
+                await send_long_message(
+                    update,
+                    praktika_unavailable_message(bilet_num),
+                    reply_markup=MAIN_KEYBOARD,
+                )
+                return
             if not await _try_charge():
                 return
-            mode = context.user_data.pop("pending_mode")
+            context.user_data.pop("pending_mode", None)
             await execute_mode(update, context, mode, bilet_num)
             await _maybe_warn_remaining(update, tg_user.id)
         else:
@@ -648,9 +721,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if text_lower in BUTTON_MODES:
         mode = BUTTON_MODES[text_lower]
         if context.user_data.get("last_bilet_num"):
+            last_num = context.user_data["last_bilet_num"]
+            if mode == "praktika" and last_num not in PRAKTIKA_FILE_IDS:
+                await send_long_message(
+                    update,
+                    praktika_unavailable_message(last_num),
+                    reply_markup=MAIN_KEYBOARD,
+                )
+                return
             if not await _try_charge():
                 return
-            await execute_mode(update, context, mode, context.user_data["last_bilet_num"])
+            await execute_mode(update, context, mode, last_num)
             await _maybe_warn_remaining(update, tg_user.id)
         else:
             context.user_data["pending_mode"] = mode

@@ -23,3 +23,6 @@ prompts_old.py
 *.jpg
 *.jpeg
 *.png
+
+# Бэкап старых версий материалов (создаётся download_praktika_from_adu.py)
+materials/primery_otvetov/_old/
