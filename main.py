@@ -387,14 +387,13 @@ def ask_openai_mode(user_text: str, mode: str, bilet_num: int | None = None) -> 
         if not file_id:
             return f"Практическое задание для билета {bilet_num} пока не подготовлено."
 
-        parts = []
-        if bilet_text:
-            parts.append(BILET_CONTEXT_TEMPLATE.format(bilet_text=bilet_text))
-        parts.append(user_text)
-
+        # NOTE: bilet_NN.txt сюда НЕ подмешиваем. Внутри одного билета теоретический
+        # и практический вопросы часто на разные темы — подмешивание текста билета
+        # вместе с BILET_CONTEXT_TEMPLATE ("не подменяй тему") заставляло модель
+        # отказываться разбирать PDF, видя в нём "подмену темы".
         result = call_openai(
             instructions=SYSTEM_PROMPT + "\n\n" + PRAKTIKA_INSTRUCTIONS,
-            user_input="\n".join(parts),
+            user_input=user_text,
             use_search=True,
             attached_file_id=file_id,
         )
@@ -450,6 +449,7 @@ def ask_openai_mode(user_text: str, mode: str, bilet_num: int | None = None) -> 
 # ---------------------------
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
     text = (
         "Привет! Я репетитор по истории Беларуси.\n\n"
         "Выбери действие кнопкой внизу, а потом напиши номер билета.\n\n"
